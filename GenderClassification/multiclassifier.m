@@ -1,0 +1,179 @@
+close all; clear; clc;
+
+% Retrieve file names and sex labels from data file
+sheetFileName = 'BVC_Voice_Bio_Public.xlsx';
+data = readtable(sheetFileName, 'Sheet', 'voice_bio_data', 'Range', 'A:B');
+audioFolderPath = 'multiple_sentences/multiple_sentences/';
+audioFiles = dir(fullfile(audioFolderPath, '*.wav'));
+
+% Initialize X and y tables
+n = length(audioFiles);
+nfeatures = 56;
+sampleRate = 48000;
+% fileLength = 3; % in seconds
+% fileLengthInSamples = sampleRate * fileLength;
+X = zeros(n, nfeatures);
+y = zeros(n, 1);
+
+% Loop through files
+for i = 1:n
+
+    % Get the file name
+    audioFileName = audioFiles(i).name;
+    fullFileName = fullfile(audioFolderPath, audioFileName);
+   
+    % Read audio file 
+    [audioData, fs] = audioread(fullFileName);
+
+    % % Low-pass filter for noise reduction
+    audioData = clean(audioData, fs);
+   
+    % % Pad the audio data for consistent sample sizing
+    % audioData = audioData(1);
+    % numSamples = length(audioData);
+    % if numSamples < fileLengthInSamples
+    %     padded = [audioData; zeros(fileLengthInSamples - numSamples, 1)];
+    % else
+    %     padded = audioData;
+    % end
+
+    % Retrieve label
+    id = str2double(audioFileName(6:9));
+    sex = data(ismember(data.New_ID, id), :).Sex{1};
+    if sex == "'Male'"
+        sex_label = 0;
+    elseif sex == "'Female'"
+        sex_label = 1;
+    end
+
+    % Append feature & label to vector
+    features = extract_features(audioData, fs);
+    for j = 1:length(features)
+        X(i, j) = features(j);
+    end
+    y(i) = sex_label;
+
+end
+
+% Data Balancing
+majorityClass = mode(y);
+minorityCount = min(histcounts(y));
+keep = false(size(y));
+for class = unique(y)'
+    classInd = find(y == class);
+    if class == majorityClass
+        selected = randperm(length(classInd), minorityCount);
+        keep(classInd(selected)) = true;
+    else
+        keep(classInd) = true;
+    end
+end
+X = X(keep, :);
+y = y(keep);
+
+% Normalize data
+Xmin = min(X(:));
+Xmax = max(X(:));
+X = (X - Xmin) / (Xmax - Xmin);
+
+% Split into train/test sets
+cv = cvpartition(y, 'HoldOut', 0.2);
+idxTrain = training(cv);
+idxTest = test(cv);
+Xtrain = X(idxTrain, :);
+ytrain = y(idxTrain);
+Xtest = X(idxTest, :);
+ytest = y(idxTest);
+
+% Standardize features
+% Xtrain = (Xtrain - mean(Xtrain)) ./ std(Xtrain);
+% Xtest = (Xtest - mean(Xtrain)) ./ std(Xtrain);
+
+% Create models
+knnModel = fitcknn(Xtrain, ytrain, ...
+    'NumNeighbors', 8, ...
+    'Standardize', true);
+svmModel = fitcsvm(Xtrain, ytrain, ...
+    'KernelFunction', 'linear', ...
+    'Standardize', true, ...
+    'ClassNames', unique(y));
+gmmModel = fitgmdist(Xtrain, 2, ...
+    'RegularizationValue', 0.1);
+gmmScores = zeros(size(Xtest, 1), 2);
+gmmScores(:, 1) = pdf(gmmModel, Xtest);
+gmmScores(:, 2) = 1 - gmmScores(:, 1);
+
+% Make predictions on each model
+[knnPred, knnScores] = predict(knnModel, Xtest);
+[svmPred, svmScores] = predict(svmModel, Xtest);
+gmmPred = cluster(gmmModel, Xtest);
+
+combined = mode([knnPred, svmPred, gmmPred], 2);
+scores = (gmmScores + knnScores + svmScores) / 3;   
+pScores = scores(:, 2);
+
+figure(1);
+disp('==== KNN METRICS ====');
+evaluate(ytest, knnScores(:, 2), knnPred);
+
+figure(2);
+disp('==== SVM METRICS ====');
+evaluate(ytest, svmScores(:, 2), svmPred);
+
+figure(3);
+disp('==== GMM METRICS ====');
+evaluate(ytest, gmmScores(:, 2), gmmPred);
+
+figure(4);
+disp('==== MULTICLASSIFIER METRICS ====');
+evaluate(ytest, pScores, combined);
+
+function features = extract_features(audio, fs)
+    coeffs = mfcc(audio, fs);
+    meanMFCC = mean(coeffs);
+    varMFCC = var(coeffs);
+    features = [meanMFCC varMFCC];
+end
+
+function audioOut = clean(audioData, fs)    
+    fc = 5000;
+    [b, a] = butter(6, fc/(fs/2));
+    audioOut = filter(b, a, audioData);
+end
+
+function plotROC(xROC, yROC, AUC)
+    plot(xROC, yROC);
+    xlabel('False Positive Rate');
+    ylabel('True Positive Rate');
+    title(['ROC Curve (AUC = ' num2str(AUC) ')']);
+end
+
+function displayMetrics(ytest, predictions)
+    cm = confusionmat(ytest, predictions);
+    acc = sum(diag(cm)) / sum(cm, 'all');
+    
+    tp = cm(2, 2);
+    fn = cm(2, 1);
+    fp = cm(1, 2);
+    tn = cm(1, 1);
+    
+    tpr = tp / (tp + fn);
+    fpr = fp / (fp + tn);
+    
+    precision = tp / (tp + fp);
+    recall = tp / (tp + fn);
+    f1 = 2 * (precision * recall) / (precision + recall);
+    
+    fprintf("CM Accuracy: %.2f%%\n", acc * 100);
+    disp('Confusion Matrix: ');
+    disp(cm);
+    fprintf('TPR = %.2f%%\n', tpr);
+    fprintf('FPR = %.2f%%\n', fpr);
+    fprintf('F1-Score: %.2f\n', f1);
+end
+
+function evaluate(ytest, scores, predictions)
+    [xROC, yROC, ~, AUC] = perfcurve(ytest, scores, 1);
+    plotROC(xROC, yROC, AUC);
+    displayMetrics(ytest, predictions);
+end
